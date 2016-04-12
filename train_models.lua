@@ -1,3 +1,6 @@
+--[[
+Training script for the model
+]]--
 paths = require 'paths'
 SemiCE = require 'SemiCE'
 
@@ -79,18 +82,23 @@ semi:make_lower_bound()
 
 -- Initialization
 if params.init_type == 'semeval' then
+    -- Initializes the recognition model by discriminative training
     semi:train_supervised('train_sentences', params.sup_batch, params.init_recog_iter, 'dev_sentences', true)
 elseif params.init_type == 'umls_pseudo' then
+    -- Performs an initial E step using only the pseudo-counts from UMLS
     semi.emissions:fill_counts(0)
     semi.emissions:normalize_cuis(params.emission_add_count,
                                   params.emission_add_count_umls)
     semi.theta = semi.MRF.theta
     semi.theta:fill(0)
     semi.MRF.part = 0
-    semi:m_step('unsup_sentences', params.unsup_batch_train, params.unsup_train_size, params.init_m_step_epochs)
+    semi:e_step('unsup_sentences', params.unsup_batch_train, params.unsup_train_size, params.init_m_step_epochs)
 end
+
 my_moments = semi:make_moments('unsup_sentences', params.unsup_batch, params.unsup_train_size)
-semi:e_step(my_moments, {maxIter = params.init_mrf_iter,
+-- The initial M step is necessary to make the MRF log-likelihood lifted
+-- lower bound tight enough to be useful
+semi:m_step(my_moments, {maxIter = params.init_mrf_iter,
                          maxEval = 1.5 * params.init_mrf_iter,
                          reg = params.mrf_reg})
 
@@ -98,7 +106,7 @@ semi:e_step(my_moments, {maxIter = params.init_mrf_iter,
 torch.save(params.rundir .. '/moments_epoch_0.t7', semi.emissions)
 semi:save_to_file(params.rundir .. '/model_save_epoch_0.t7')
 
--- EM iterations
+-- Run params.em_iter EM iterations
 for i = 1, params.em_iter do
     print('iteration \t', i)
     
@@ -110,13 +118,13 @@ for i = 1, params.em_iter do
     
     -- E step
     print('E step \t', i)
-    semi:m_step('unsup_sentences', params.unsup_batch_train, params.unsup_train_size, params.m_step_epochs)
+    semi:e_step('unsup_sentences', params.unsup_batch_train, params.unsup_train_size, params.m_step_epochs)
     collectgarbage()
     my_moments = semi:make_moments('unsup_sentences', params.unsup_batch, params.unsup_train_size)
     
     -- M step
     print('M step \t', i)
-    semi:e_step(my_moments, {maxIter = params.mrf_iter,
+    semi:m_step(my_moments, {maxIter = params.mrf_iter,
                              maxEval = 1.5 * params.mrf_iter,
                              reg = params.mrf_reg})
     

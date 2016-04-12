@@ -1,9 +1,23 @@
+--[[
+This class implements a generative model of concept mentions, which factorizes
+as p(concepts)p(mentions|concepts), as well as functions to maximize a lower
+bound on the likelihood of unlabeled mentions using an EM-like algorithm
+]]--
 local class = require 'class'
 local hdf5 = require 'hdf5'
 local nn = require 'nn'
-local nngraph = require "nngraph"
+local nngraph = require 'nngraph'
+local rnn = require 'rnn'
+local cutorch = require 'cutorch'
+local cunn = require 'cunn'
+local CSLM = require 'CSLM'
+local ChainMRF = require 'ChainMRF'
+local Emissions = require 'Emissions'
 
--- expand Narrow just take offset (without specifying length)
+local SemiCE = class('SemiCE')
+
+
+-- expand Narrow to just take offset as argument (without specifying length)
 function nn.Narrow:updateOutput(input)
   local save = false
   if self.length <= 0 then
@@ -36,22 +50,13 @@ function nn.Narrow:updateGradInput(input, gradOutput)
 end
 
 
-local rnn = require 'rnn'
 -- fix a bug in the rnn implementation of padded lookup table
 function nn.LookupTableMaskZero:accGradParameters(input, gradOutput, scale)
 	nn.LookupTable.accGradParameters(self, torch.add(input, 1), gradOutput, scale)
 end
 
-local cutorch = require 'cutorch'
-local cunn = require 'cunn'
 
-local CSLM = require 'CSLM'
-local ChainMRF = require 'ChainMRF'
-local Emissions = require 'Emissions'
-
-local SemiCE = class('SemiCE')
-
-
+-- Define a model class
 function SemiCE:__init(config)
   self.conf = config or {}
   self.word_d = self.conf.word_dim or 100
@@ -166,6 +171,8 @@ function make_embedding(input_words_current, input_words_left, input_words_right
 end
 
 
+-- The recognition model gives a mean-field approximation to the posterior
+-- distribution p(concepts|mentions)
 function SemiCE:make_recognition()
   self.word_embedding = nn.LookupTableMaskZero(#self.word_voc, self.word_d)
   if self.cuda then
@@ -429,6 +436,8 @@ function SemiCE:make_batch(begin, batch_size, data_set,
 end
 
 
+-- This function evaluates the accuracy of the recognition model when used
+-- to predict concepts given mentions
 function SemiCE:evaluate(data_set, mb_size, use_neighbours)
   local criterion = nn.ClassNLLCriterion()
   if self.cuda then
@@ -466,6 +475,8 @@ function SemiCE:evaluate(data_set, mb_size, use_neighbours)
 end
 
 
+-- The following funtion trains the recognition model in a discriminative
+-- way in labeled data
 function SemiCE:train_supervised(data_set, mb_size, n_epochs, valid_set, use_neighbours)
   local criterion = nn.ClassNLLCriterion()
   if self.cuda then
@@ -535,115 +546,9 @@ function SemiCE:update_emissions(current_mentions, log_probas)
 end
 
 
-function SemiCE:make_moments(data_set, mb_size, max_length, start)
-  self.record_bound = self.record_bound or {}
-  
-  local start = start or 1
-  local rec_entropy = 0
-  
-  local max_length = max_length or self.data[data_set]:size()[1]
-  self.emissions:fill_counts(0)
-  
-  local moments = torch.Tensor(self.K * #self.cui_voc * #self.cui_voc):fill(0)
-  
-  local sup_a, sup_b, probs_a, probs_b
-  local probs_prod = torch.zeros(self.max_cuis, self.max_cuis)
-    
-  local probas = torch.Tensor(mb_size, 2, self.max_cuis)
-  local pad_probas = torch.zeros(self.max_cuis)
-  local new_probs = torch.Tensor(self.max_cuis * self.max_cuis)
-  pad_probas[1] = 1
-  
-  local tok = start
-  local batches = 0
-  while tok <= start + max_length - mb_size - 1 do
-    batches = batches + 1
-    if batches % 100 == 0 then
-      print('progress', (tok - start) / max_length)
-    end
-    local batch = self:make_batch(tok, mb_size, data_set, true, true)
-    local inputs = {batch.current_words,
-                    batch.left_words,
-                    batch.right_words,
-                    batch.supports,
-                    batch.mask}
-                    -- batch.proximities}
-    local log_probas = self.recognition:forward(inputs)
-    rec_entropy = rec_entropy + torch.cmul(torch.exp(log_probas), log_probas):sum()
-    -- write q(z_i | w)
-    probas:select(2, 1):copy(batch.supports)
-    probas:select(2, 2):copy(torch.exp(log_probas))
-    -- collect emissions moments
-    self:update_emissions(batch.current_mentions, log_probas)
-    -- collect MRF moments
-    for b = 1, mb_size - self.K, 1 do
-      sup_a = (torch.expand(probas[b][1]:view(self.max_cuis, 1),
-                            self.max_cuis,
-                            self.max_cuis):long():view(self.max_cuis * self.max_cuis) - 1) * #self.cui_voc
-      probs_a = probas[b][2]
-      for k = 1, self.K, 1 do
-        sup_b = torch.expand(probas[b + k][1]:view(1, self.max_cuis),
-                             self.max_cuis,
-                             self.max_cuis):long():view(self.max_cuis * self.max_cuis)
-        probs_b = probas[b + k][2]
-        probs_prod:fill(0)
-        probs_prod:addr(probs_a, probs_b)
-        -- print(tok, b, k, probs_prod:sum())
-        indices = sup_a + sup_b  + (k - 1) * #self.cui_voc * #self.cui_voc
-        new_probs:add(moments:index(1, indices), probs_prod:view(self.max_cuis * self.max_cuis))
-        moments:indexCopy(1, indices, new_probs)
-      end
-    end
-    -- next batch
-    tok = batch.last_tok - self.K
-  end
-  
-  rec_entropy = -rec_entropy / mb_size / batches  
-  self.record_bound[#self.record_bound + 1] = {rec_entropy = rec_entropy,
-                                               data_set = 'train'}
-  
-  moments = moments:view(self.K, #self.cui_voc, #self.cui_voc):contiguous()
-  local norm_div = moments[1]:sum()
-  for k = 1, self.K do
-    moments[k] = moments[k]:div(norm_div)
-  end
-  return moments
-end
-
-
-function SemiCE:e_step(moments, config)
-  -- pcall(function() torch.CudaTensor(1, 1) end)                            -- TODO: REMOVE HACK!!!!!!
-  
-  -- E step: MRF
-  local last_obj = self.MRF:optimize(moments, config)
-  self.theta = self.MRF.theta
-  self.record_bound[#self.record_bound].mrf_bound = - last_obj
-  
-  -- E step: emissions
-  local emission_bound
-  if self.conf.emission_nn == 1 then
-    emission_bound = self.emissions:learn_nn()
-  else
-    emission_bound = self.emissions:normalize_cuis(self.conf.emission_add_count,
-                                                   self.conf.emission_add_count_umls)
-  end
-  
-  self.record_bound[#self.record_bound].emission_bound = emission_bound
-  
-  -- compute total bound
-  local bound = self.record_bound[#self.record_bound].mrf_bound +
-                self.record_bound[#self.record_bound].emission_bound +
-                self.record_bound[#self.record_bound].rec_entropy
-  
-  self.record_bound[#self.record_bound].total_bound = bound
-  
-  return bound
-end
-
-
-function SemiCE:m_step(data_set, mb_size, max_length, n_epochs)
-  -- pcall(function() torch.CudaTensor(1, 1) end)                            -- TODO: REMOVE HACK!!!!!!
-  
+-- The first part of the E step tightens the log-likelihood lower bound by
+-- optimizing the recognition model parameters
+function SemiCE:e_step(data_set, mb_size, max_length, n_epochs)  
   local config = {}
   local state = {}
   
@@ -686,7 +591,6 @@ function SemiCE:m_step(data_set, mb_size, max_length, n_epochs)
                       batch.right_words,
                       batch.supports,
                       batch.mask}
-                    -- batch.proximities}
       local log_probas = self.recognition:forward(inputs)
       -- select emission probas from supports, words
       for b = 1, mb_size - self.K, 1 do
@@ -763,6 +667,115 @@ function SemiCE:m_step(data_set, mb_size, max_length, n_epochs)
 end
 
 
+-- The second part of the E step computes the expected moments under the
+-- recognition model
+function SemiCE:make_moments(data_set, mb_size, max_length, start)
+  self.record_bound = self.record_bound or {}
+  
+  local start = start or 1
+  local rec_entropy = 0
+  
+  local max_length = max_length or self.data[data_set]:size()[1]
+  self.emissions:fill_counts(0)
+  
+  local moments = torch.Tensor(self.K * #self.cui_voc * #self.cui_voc):fill(0)
+  
+  local sup_a, sup_b, probs_a, probs_b
+  local probs_prod = torch.zeros(self.max_cuis, self.max_cuis)
+    
+  local probas = torch.Tensor(mb_size, 2, self.max_cuis)
+  local pad_probas = torch.zeros(self.max_cuis)
+  local new_probs = torch.Tensor(self.max_cuis * self.max_cuis)
+  pad_probas[1] = 1
+  
+  local tok = start
+  local batches = 0
+  while tok <= start + max_length - mb_size - 1 do
+    batches = batches + 1
+    if batches % 100 == 0 then
+      print('progress', (tok - start) / max_length)
+    end
+    local batch = self:make_batch(tok, mb_size, data_set, true, true)
+    local inputs = {batch.current_words,
+                    batch.left_words,
+                    batch.right_words,
+                    batch.supports,
+                    batch.mask}
+                    -- batch.proximities}
+    local log_probas = self.recognition:forward(inputs)
+    rec_entropy = rec_entropy + torch.cmul(torch.exp(log_probas), log_probas):sum()
+    -- write q(z_i | w)
+    probas:select(2, 1):copy(batch.supports)
+    probas:select(2, 2):copy(torch.exp(log_probas))
+    -- collect emissions moments
+    self:update_emissions(batch.current_mentions, log_probas)
+    -- collect MRF moments
+    for b = 1, mb_size - self.K, 1 do
+      sup_a = (torch.expand(probas[b][1]:view(self.max_cuis, 1),
+                            self.max_cuis,
+                            self.max_cuis):long():view(self.max_cuis * self.max_cuis) - 1) * #self.cui_voc
+      probs_a = probas[b][2]
+      for k = 1, self.K, 1 do
+        sup_b = torch.expand(probas[b + k][1]:view(1, self.max_cuis),
+                             self.max_cuis,
+                             self.max_cuis):long():view(self.max_cuis * self.max_cuis)
+        probs_b = probas[b + k][2]
+        probs_prod:fill(0)
+        probs_prod:addr(probs_a, probs_b)
+        -- print(tok, b, k, probs_prod:sum())
+        indices = sup_a + sup_b  + (k - 1) * #self.cui_voc * #self.cui_voc
+        new_probs:add(moments:index(1, indices), probs_prod:view(self.max_cuis * self.max_cuis))
+        moments:indexCopy(1, indices, new_probs)
+      end
+    end
+    -- next batch
+    tok = batch.last_tok - self.K
+  end
+  
+  rec_entropy = -rec_entropy / mb_size / batches  
+  self.record_bound[#self.record_bound + 1] = {rec_entropy = rec_entropy,
+                                               data_set = 'train'}
+  
+  moments = moments:view(self.K, #self.cui_voc, #self.cui_voc):contiguous()
+  local norm_div = moments[1]:sum()
+  for k = 1, self.K do
+    moments[k] = moments[k]:div(norm_div)
+  end
+  return moments
+end
+
+
+-- The M step maximizes the log-likelihood lower bound given by the recognition
+-- model by optimizing the generative model parameters
+function SemiCE:m_step(moments, config)  
+  -- M step: MRF
+  local last_obj = self.MRF:optimize(moments, config)
+  self.theta = self.MRF.theta
+  self.record_bound[#self.record_bound].mrf_bound = - last_obj
+  
+  -- M step: emissions
+  local emission_bound
+  if self.conf.emission_nn == 1 then
+    emission_bound = self.emissions:learn_nn()
+  else
+    emission_bound = self.emissions:normalize_cuis(self.conf.emission_add_count,
+                                                   self.conf.emission_add_count_umls)
+  end
+  
+  self.record_bound[#self.record_bound].emission_bound = emission_bound
+  
+  -- compute total bound
+  local bound = self.record_bound[#self.record_bound].mrf_bound +
+                self.record_bound[#self.record_bound].emission_bound +
+                self.record_bound[#self.record_bound].rec_entropy
+  
+  self.record_bound[#self.record_bound].total_bound = bound
+  
+  return bound
+end
+
+
+-- This function computes the current value of the log-likelihood lower bound
 function SemiCE:compute_bound(data_set, mb_size, max_length, start)
   local max_length = max_length or self.data[data_set]:size()[1]
   local start = start or 1
@@ -794,7 +807,6 @@ function SemiCE:compute_bound(data_set, mb_size, max_length, start)
                     batch.right_words,
                     batch.supports,
                     batch.mask}
-                    -- batch.proximities}
     local log_probas = self.recognition:forward(inputs)
     -- select emission probas from supports, words
     for b = 1, mb_size - self.K, 1 do

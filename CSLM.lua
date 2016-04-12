@@ -1,3 +1,8 @@
+--[[
+This class implements a chain Markov Chain of order K with factorized
+log-potentials, along with functions to maximize a lifted lower bound on
+data log-likelihood
+]]--
 local class = require 'class'
 local optim = require 'optim'
 local cutorch = require 'cutorch'

@@ -1,3 +1,7 @@
+--[[
+This class parametrizes the emission distribution p(mention|concept)
+as either a multinomial or a neural network
+]]--
 local class = require 'class'
 
 local Emissions = class('Emissions')
@@ -135,10 +139,7 @@ function Emissions:test_obj()
 end
 
 
---[[
-Parameterized emission distribution. TODO: fix CUDA
-]]--
--- makes and initialize emission distribution NN
+-- makes and initializes emission distribution NN
 function Emissions:make_emissions(word_d, cui_d, cuda, batch_size)
   self.word_d = word_d or self.semi.word_d
   self.cui_d = cui_d or self.semi.cui_d
@@ -183,7 +184,7 @@ end
 
 
 -- prepares inputs to compute partial objective on a batch of CUIS
--- given current counts and emissions NN
+-- given current counts and emission NN
 function Emissions:make_batch(batch_start)
   local batch_len = self.batch_size
   local batch_end = math.min(batch_start + batch_len - 1, #self.sorted_cuis)
@@ -238,7 +239,7 @@ function Emissions:make_batch(batch_start)
 end
 
 
--- computes objective and gradients for emissions NN
+-- computes objective and gradients for emission NN
 function Emissions:run_corpus(x)
   local cui_id, cui_moments, inputs, log_probas, grads
   
@@ -295,7 +296,7 @@ function Emissions:run_corpus(x)
 end
 
 
--- Learns emissions NN parameters with lbfgs / adam / adagrad
+-- Learns emission NN parameters with lbfgs / adam / adagrad
 function Emissions:learn_nn(conf)
   local conf = conf or {}
   conf.algo = conf.algo or 'lbfgs'
