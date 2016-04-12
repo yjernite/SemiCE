@@ -1,6 +1,6 @@
-#~ Reads a dictionary (UMLS), labeled data (mention scopes and labels, Semeval),
-#~ and unlabeled data (mention scopes without label) and outputs hdf5 files
-#~ to be read by the Torch code.
+#~ Reads a dictionary (UMLS), labeled data (mention scopes and labels,
+#~ Semeval), and unlabeled data (mention scopes without label, MIMIC) and
+#~ outputs hdf5 files to be read by the Torch code.
 import h5py
 import cPickle as pickle
 from os.path import join as pjoin
