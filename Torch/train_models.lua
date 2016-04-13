@@ -71,7 +71,7 @@ end
 semi = SemiCE(params)
 
 vocab_files = {men_voc_file = 'processed_data/mention_vocab.txt',
-               cui_voc_file = 'processed_data/cui_vocab.txt',
+               cui_voc_file = 'processed_data/label_vocab.txt',
                word_voc_file = 'processed_data/word_vocab.txt'}
 semi:read_vocabs(vocab_files)
 semi:read_data('processed_data/processed_data.hdf5')

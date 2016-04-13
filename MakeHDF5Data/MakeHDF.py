@@ -6,9 +6,11 @@ import h5py
 import cPickle as pickle
 import numpy as np
 from os.path import join as pjoin
-from nltk.tokenize import word_tokenize as split_tokens
+from difflib import SequenceMatcher
+from subprocess import call
 
-data_dir = '../Data'
+data_dir = os.path.abspath('../Data')
+output_dir = os.path.abspath('pre_processed')
 
 ## Load dictionary
 # The dictionary is provided as a python dict, with labels as keys and
@@ -58,9 +60,28 @@ for concept, mentions in dictionary.items():
         for w in mention.split():
             dic_vocab_counts[w] = dic_vocab_counts.get(w, 0) + 1
 
-label_voc = ['<UNK>', '<S>'] + dictionary.keys()
+labels_voc = ['<UNK>', '<S>'] + dictionary.keys()
 words_voc = ['<UNK>', '<S>'] + list(set(vocab_counts.keys() + dic_vocab_counts.keys()))
 mentions_voc = ['<UNK>', '<S>'] + list(set(mention_counts.keys() + dic_mention_counts.keys()))
+
+
+# For each mention, we define a smaller set of possible labels, or support.
+# There are several ways to do this pre-processing step depending on the
+# application domain. Here, we rely on a string distance metric and threshold
+# the distance between a mention and the label descriptions given in the
+# dictionary.
+def str_distance(mention, label):
+    return max([SequenceMatcher(None, mention, desc).ratio()
+                for desc in dictionary.get(label, [])])
+
+
+def get_support(mention, threshold=0.5):
+    res = [label for label in dictionary if str_distance(mention, label) > threshold]
+    return ['<UNK>'] + res
+
+mention_supports = [get_support(mention) for mention in mentions_voc]
+mention_supports[0] = ['<UNK>']
+mention_supports[1] = ['<S>']
 
 ## Make feature representations (neighbours)
 word_k = 5
@@ -108,8 +129,11 @@ def make_features(data):
 		features += doc_features[:]
     return features
 
+word_lookup = dict([(w, i) for i, w in enumerate(words_voc)])
+mention_lookup = dict([(w, i) for i, w in enumerate(mentions_voc)])
+label_lookup = dict([(w, i) for i, w in enumerate(labels_voc)])
 
-# TODO: here
+
 def read_features(features):
     res = []
     for w in feature['left_words'] + feature['right_words']:
@@ -117,7 +141,7 @@ def read_features(features):
     for men in feature['left_mentions'] + feature['right_mentions']:
         res += [mention_lookup[men]]
     res += [mention_lookup[feature['mention']]]
-    res += [cui_lookup.get(feature['label'], cui_lookup['CUI-less'])]
+    res += [label_lookup['label']]
     return res
 
 
@@ -128,83 +152,51 @@ def make_features_array(features):
             array[i, j] = feat
     return array
 
-
 # data in array format
-(train_array, train_array_full) = make_features_array(train_features, train_features_full)
-(dev_array, dev_array_full) = make_features_array(dev_features, dev_features_full)
-(unsup_array, unsup_array_full) = make_features_array(unsup_features, unsup_features_full)
+sup_array = make_features_array(make_features(labeled_data))
+unsup_array = make_features_array(make_features(unlabeled_data))
 
+max_sup = max([len(sup) for sup in mention_supports])
+support_array = np.zeros((len(mention_supports), max_sup))
+for i, men in enumerate(mentions_voc):
+    sup = [label_lookup[label] for label in mention_supports[men]]
+    for j, label in enumerate(sorted(sup)):
+        support_array[i, j] = label
+
+max_words = max([len(mention.split()) for mention in mentions_voc])
+mention_to_words_array = np.zeros((len(mention_supports), max_words))
+for i, men in enumerate(mentions_voc):
+    for j, w in enumerate(men.split()):
+        mention_to_words_array[i, j] = word_lookup[w]
 
 ## Write to hdf5
-# supports
-max_sup = max([len(sup) for sup in mention_supports.values()]) + 2
-support_array = np.ones((len(mention_supports), max_sup))
-for i, men in enumerate(mention_vocab):
-    sup = [cui_lookup[cui] for cui in mention_supports.get(men, []) + ['CUI-less'] + ['NONE']]
-    for j, cui in enumerate(sorted(sup)):
-        support_array[i, j] = cui
+call(["mkdir", output_dir])
 
-# train matches
-max_train = max([len(sup) for sup in train_lookup.values()])
-train_lookup_array = np.ones((len(mention_vocab), max_train))
-for i, men in enumerate(mention_vocab):
-    sup = [cui_lookup.get(cui, 1) for cui in train_lookup.get(men, [])]
-    for j, cui in enumerate(sorted(sup)):
-        train_lookup_array[i, j] = cui
-
-# umls matches
-max_umls = max([len(sup) for sup in my_lookup.values()]) + 1
-umls_lookup_array = np.ones((len(mention_vocab), max_umls))
-for i, men in enumerate(mention_vocab):
-    sup = [cui_lookup[cui] for cui in my_lookup.get(men, [])+ ['CUI-less']]
-    for j, cui in enumerate(sorted(sup)):
-        umls_lookup_array[i, j] = cui
-
-
-# alternatively, one support file
-def candidates(st):
-    poss = []
-    if st in train_lookup:
-        return (train_lookup[st], 'Training')
-    elif st in my_lookup:
-        for cui in my_lookup[st]:
-            if UMLS[cuitoid[cui]][1] == st:
-                return ([cui], 'Concept_name')
-        return (my_lookup[st] + ['NONE'], 'Lookup')
-    else:
-        supp = pre_select(st, my_lookup, has_pref) + ['CUI-less'] + ['NONE']
-        return (supp, 'Support')
-
-max_all = max(max_sup, max_umls + max_train)
-full_support_array = np.ones((len(mention_supports), max_all))
-
-for i, men in enumerate(mention_vocab):
-    (poss, reason) = candidates(men)
-    sup = [cui_lookup.get(cui, 1) for cui in poss]
-    for j, cui in enumerate(sorted(sup)):
-        full_support_array[i, j] = cui
-
-print('Made support arrays')
-
-f = h5py.File(save_dir + "/features.hdf5", "w")
-dset_train = f.create_dataset("train", data=train_array)
-dset_dev = f.create_dataset("dev", data=dev_array)
-dset_unsup = f.create_dataset("unsup", data=unsup_array)
-dset_train = f.create_dataset("train_full", data=train_array_full)
-dset_dev = f.create_dataset("dev_full", data=dev_array_full)
-dset_unsup = f.create_dataset("unsup_full", data=unsup_array_full)
+f = h5py.File(pjoin(output_dir, "features.hdf5"), "w")
+dset_sup = f.create_dataset("supervised", data=sup_array)
+dset_unsup = f.create_dataset("unsupervised", data=unsup_array)
+dset_supports = f.create_dataset("support", data=support_array)
+dset_men_to_words = f.create_dataset("men_to_words", data=mention_to_words_array)
 f.close()
 
-f = h5py.File(save_dir + "/supports.hdf5", "w")
-dset_sup = f.create_dataset("support", data=support_array)
-dset_train = f.create_dataset("train_lookup", data=train_lookup_array)
-dset_umls = f.create_dataset("umls_lookup", data=umls_lookup_array)
+## Write vocab files
+f = open(pjoin(output_dir, "mention_vocab.txt"), "w")
+for mention in mentions_voc:
+    print >>f, mention
+
 f.close()
 
-f = h5py.File(save_dir + "/full_support.hdf5", "w")
-dset_sup = f.create_dataset("full_support", data=full_support_array)
+f = open(pjoin(output_dir, "label_vocab.txt"), "w")
+for label in labels_voc:
+    print >>f, label
+
 f.close()
 
+f = open(pjoin(output_dir, "word_vocab.txt"), "w")
+for word in words_voc:
+    print >>f, word
+
+f.close()
 
 print('All done')
 
