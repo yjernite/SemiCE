@@ -21,6 +21,14 @@ Required Torch packages:
 * optim
 * hdf5 from [Deepmind](https://github.com/deepmind/torch-hdf5)
 
+## Project organization
+
+The different code files contain:
+* CSLM.lua, ChainMRF.lua: joint probability distribution on the concepts, parametrized as a factorized or unfacrorainzed Markov chain model respectively
+* Emissions.lua: conditional probability of a mention given a concept, parametrized as a multinomial or neural network
+* SemiCE.lua: full generative model and recognition distribution (parametrized as a neural network)
+* train_models.lua: wrapper script to initialize and train a model on unlabelled data
+
 ## Use
 
 MakeHDF5Data/MakeHDF.py loads some labeled and unlabeled data as well as a 
