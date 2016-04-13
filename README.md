@@ -1,6 +1,6 @@
 # SemiCE
 
-Code base for semi supervised concept extraction project
+Code base for our semi supervised concept extraction project.
 
 ## Installation
 
@@ -23,6 +23,12 @@ Required Torch packages:
 
 ## Use
 
-MakeHDF5Data/MakeHDF.py writes vocabulary and data files in hdf5 format to be read by the Torch code.
+MakeHDF5Data/MakeHDF.py loads some labeled and unlabeled data as well as a 
+dictionary mapping labels (concepts) to descriptions (mentions), and writes
+vocabulary and data files in hdf5 format to be read by the Torch code.
+The format for the input is described in the comments.
 
-The main training script is Torch/train_models.lua.
+The main training script is Torch/train_models.lua. For information on the
+arguments, run:
+
+`$ th train_models.lua -h`
